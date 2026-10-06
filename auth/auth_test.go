@@ -71,6 +71,43 @@ func newFixtureLimit(t *testing.T, maxAttempts int) *fixture {
 	return &fixture{svc: svc, policy: policy, store: store, signer: signer, clock: clk}
 }
 
+// newGovFixture builds a facade whose session store enforces governance:
+// per-account cap, idle and absolute lifetimes, all driven by the fake clock.
+func newGovFixture(t *testing.T, maxActive int, idle, absolute time.Duration) *fixture {
+	return newGovFixtureTTL(t, maxActive, idle, absolute, 10*time.Minute, 24*time.Hour)
+}
+
+// newGovFixtureTTL also overrides the credential TTLs so session-lifetime
+// conclusions can be tested independently of credential expiry.
+func newGovFixtureTTL(t *testing.T, maxActive int, idle, absolute, accessTTL, refreshTTL time.Duration) *fixture {
+	t.Helper()
+	policy := rbac.NewPolicy(map[string][]string{
+		"admin":  {"read:doc", "write:doc", "admin:users"},
+		"reader": {"read:doc"},
+	})
+	clk := &fakeClock{t: time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)}
+	store := session.NewGovernedStore(session.GovernanceConfig{
+		MaxActivePerSubject: maxActive,
+		IdleTTL:             idle,
+		AbsoluteTTL:         absolute,
+		Clock:               clk.now,
+	})
+	signer := token.NewLocalSigner([]byte("integration-secret"))
+	svc := NewService(Config{
+		Signer:     signer,
+		Store:      store,
+		Policy:     policy,
+		Limiter:    ratelimit.New(10000, time.Minute),
+		AccessTTL:  accessTTL,
+		RefreshTTL: refreshTTL,
+		Clock:      clk.now,
+	})
+	if err := svc.AddUser("u-reader", "Reader", "reader", "pw-reader"); err != nil {
+		t.Fatal(err)
+	}
+	return &fixture{svc: svc, policy: policy, store: store, signer: signer, clock: clk}
+}
+
 func (f *fixture) login(t *testing.T, subject, pw, source string) *CredentialBundle {
 	t.Helper()
 	b, err := f.svc.Login(context.Background(), subject, pw, source)

@@ -31,6 +31,17 @@ type CredentialBundle struct {
 	RefreshExpires time.Time
 }
 
+// SessionInfo is the management view of one ACTIVE session: enough to answer
+// "which live sessions does this account have, from where, and how recently
+// have they been used" without exposing internal refresh state.
+type SessionInfo struct {
+	ID             string
+	Subject        string
+	Source         string
+	CreatedAt      time.Time
+	LastActivityAt time.Time
+}
+
 // Principal is the authenticated identity plus the EFFECTIVE scopes at the
 // moment of the decision: live policy scopes intersected with the scopes the
 // credential itself carries. Revoking a scope therefore disables it on every
@@ -85,15 +96,34 @@ type Config struct {
 	Limiter    ratelimit.Limiter
 	AccessTTL  time.Duration
 	RefreshTTL time.Duration
+	// MaxActiveSessions bounds the number of concurrently ACTIVE sessions per
+	// account; overflow evicts the least recently active session. <=0 means
+	// unbounded. Ignored when Store is provided already configured.
+	MaxActiveSessions int
+	// SessionIdleTTL is the idle lifetime: authenticate/refresh count as
+	// activity and reset this clock. <=0 disables idle expiry.
+	SessionIdleTTL time.Duration
+	// SessionAbsoluteTTL is the hard lifetime since session creation; renewal
+	// can never extend past it. <=0 disables absolute expiry.
+	SessionAbsoluteTTL time.Duration
 	// Clock defaults to time.Now; inject a controllable clock in tests.
 	Clock func() time.Time
 }
 
 // NewService constructs a facade.
 func NewService(cfg Config) *Service {
+	store := cfg.Store
+	if store == nil {
+		store = session.NewGovernedStore(session.GovernanceConfig{
+			MaxActivePerSubject: cfg.MaxActiveSessions,
+			IdleTTL:             cfg.SessionIdleTTL,
+			AbsoluteTTL:         cfg.SessionAbsoluteTTL,
+			Clock:               cfg.Clock,
+		})
+	}
 	s := &Service{
 		signer:     cfg.Signer,
-		store:      cfg.Store,
+		store:      store,
 		policy:     cfg.Policy,
 		limiter:    cfg.Limiter,
 		accessTTL:  cfg.AccessTTL,
@@ -201,18 +231,13 @@ func (s *Service) Refresh(ctx context.Context, rawRefresh, source string) (*Cred
 	// (session_invalid) even under concurrent submissions.
 	res := s.store.Rotate(ctx, claims.SessionID, claims.JTI, newID("rt"), now)
 	if !res.OK {
-		switch {
-		case res.Replayed:
-			// Lost the race or presented an already-consumed credential:
-			// the chain is now explicitly invalid.
+		// A presented credential already consumed is always a replay, even
+		// when the chain has meanwhile reached another terminal state: the
+		// refresh single-use conclusion is preserved exactly as before.
+		if res.Replayed {
 			return nil, autherr.ReusedRefresh()
-		case res.Reason == session.StateRevoked:
-			return nil, autherr.New(autherr.ReasonSessionInvalid, "session has been revoked")
-		case res.Reason == session.StateExpired:
-			return nil, autherr.New(autherr.ReasonSessionInvalid, "session has expired")
-		default:
-			return nil, autherr.SessionInvalid()
 		}
+		return nil, sessionFailure(res.Reason)
 	}
 
 	return s.mintBundle(ctx, res.Session)
@@ -260,12 +285,65 @@ func (s *Service) Revoke(ctx context.Context, subject, sessionID string) {
 	s.store.Revoke(ctx, subject, sessionID)
 }
 
+// ListSessions returns the currently ACTIVE sessions of a subject (source,
+// creation and last-activity times). Elapsed sessions are settled lazily.
+func (s *Service) ListSessions(ctx context.Context, subject string) []SessionInfo {
+	active := s.store.ListActive(ctx, subject)
+	out := make([]SessionInfo, 0, len(active))
+	for _, sess := range active {
+		out = append(out, SessionInfo{
+			ID:             sess.ID,
+			Subject:        sess.Subject,
+			Source:         sess.Source,
+			CreatedAt:      sess.CreatedAt,
+			LastActivityAt: sess.LastActivityAt,
+		})
+	}
+	return out
+}
+
+// KickSession terminates exactly one session. It reports whether the id named
+// an existing session. Other sessions of the same account are untouched.
+func (s *Service) KickSession(ctx context.Context, sessionID string) bool {
+	return s.store.Kick(ctx, sessionID, s.now())
+}
+
+// KeepOnlySession terminates every other ACTIVE session of subject except
+// keepID ("keep this one, kick the rest") and returns how many were kicked.
+func (s *Service) KeepOnlySession(ctx context.Context, subject, keepID string) int {
+	return s.store.KeepOnly(ctx, subject, keepID, s.now())
+}
+
 // ResetLimit clears a rate-limit bucket (test/admin utility).
 func (s *Service) ResetLimit(ctx context.Context, k ratelimit.Key) {
 	s.limiter.Reset(ctx, k)
 }
 
 // ---------------------------------------------------------------------------
+
+// sessionFailure maps a terminal session.Store state to its distinct, stable
+// normalized rejection reason. Each governance outcome is distinguishable
+// both from the others and from credential_expired.
+func sessionFailure(st session.State) *autherr.Error {
+	switch st {
+	case session.StateEvicted:
+		return autherr.SessionEvicted()
+	case session.StateIdleExpired:
+		return autherr.SessionIdleExpired()
+	case session.StateAbsoluteExpired:
+		return autherr.SessionAbsoluteExpired()
+	case session.StateKicked:
+		return autherr.SessionKicked()
+	case session.StateRevoked:
+		return autherr.New(autherr.ReasonSessionInvalid, "session has been revoked")
+	case session.StateExpired:
+		return autherr.New(autherr.ReasonSessionInvalid, "session has expired")
+	case session.StateInvalid:
+		return autherr.New(autherr.ReasonSessionInvalid, "session invalidated by refresh replay")
+	default:
+		return autherr.SessionInvalid()
+	}
+}
 
 func (s *Service) authenticate(ctx context.Context, rawAccess string) (*Principal, string, error) {
 	if rawAccess == "" {
@@ -291,22 +369,19 @@ func (s *Service) authenticate(ctx context.Context, rawAccess string) (*Principa
 		if claims.SessionID == "" {
 			return nil, "", autherr.InvalidCredential()
 		}
-		sess, err := s.store.Get(ctx, claims.SessionID)
-		if err != nil {
-			return nil, "", autherr.SessionInvalid()
+		// Touch is the single atomic decision point: it evaluates the idle and
+		// absolute lifetimes, rejects evicted/kicked/revoked/invalid chains
+		// with their specific reason, and records this access as activity
+		// (resetting the idle clock) only when the session is still live.
+		res := s.store.Touch(ctx, claims.SessionID, now)
+		if !res.OK {
+			return nil, "", sessionFailure(res.Reason)
 		}
-		switch sess.State {
-		case session.StateActive:
-			sessionBasis = "session " + sess.ID + " active at chain v" + itoa(sess.Version)
-		case session.StateRevoked:
-			return nil, "", autherr.New(autherr.ReasonSessionInvalid, "session has been revoked")
-		case session.StateInvalid:
-			return nil, "", autherr.New(autherr.ReasonSessionInvalid, "session invalidated by refresh replay")
-		case session.StateExpired:
-			return nil, "", autherr.New(autherr.ReasonSessionInvalid, "session has expired")
-		default:
-			return nil, "", autherr.SessionInvalid()
-		}
+		sess := res.Session
+		sessionBasis = "session " + sess.ID + " active at chain v" + itoa(sess.Version) +
+			"; lastActivity=" + sess.LastActivityAt.UTC().Format(time.RFC3339) +
+			"; idleTTL=" + sess.IdleTTL.String() +
+			"; absoluteDeadline=" + sess.AbsoluteDeadline.UTC().Format(time.RFC3339)
 	}
 
 	// Effective scopes = live policy scopes intersected with credential scopes.
