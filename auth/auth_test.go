@@ -113,13 +113,15 @@ func TestDistinguishableRejectionReasons(t *testing.T) {
 		t.Logf("input=<empty> -> reason=%s", autherr.ReasonOf(err))
 	}
 
-	// Tampered: flip a byte in the signature segment.
-	tampered := b.Access[:len(b.Access)-1]
-	if strings.HasSuffix(tampered, "A") {
-		tampered += "B"
-	} else {
-		tampered += "A"
+	// Tampered: flip the first (fully significant) character of the
+	// signature segment so the decoded MAC genuinely changes.
+	i := strings.LastIndex(b.Access, ".")
+	sig := b.Access[i+1:]
+	repl := byte('A')
+	if sig[0] == 'A' {
+		repl = 'B'
 	}
+	tampered := b.Access[:i+1] + string(repl) + sig[1:]
 	if _, _, err := f.svc.Authorize(ctx, tampered, "read:doc"); autherr.ReasonOf(err) != autherr.ReasonInvalidCredential {
 		t.Fatalf("want invalid, got %v", err)
 	} else {

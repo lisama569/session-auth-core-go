@@ -12,14 +12,18 @@ type Reason string
 
 const (
 	ReasonNone              Reason = ""
-	ReasonInvalidCredential Reason = "invalid_credential" // malformed or tampered credential
-	ReasonMissingCredential Reason = "missing_credential" // no credential presented
-	ReasonExpiredCredential Reason = "credential_expired" // well-formed but past expiry
-	ReasonReusedRefresh     Reason = "refresh_replayed"   // refresh credential already consumed
-	ReasonSessionInvalid    Reason = "session_invalid"    // chain invalidated by replay/revocation
-	ReasonPermissionDenied  Reason = "permission_denied"  // authenticated but scope absent/revoked
-	ReasonRateLimited       Reason = "rate_limited"       // too many attempts for account/source
-	ReasonInternal          Reason = "internal_error"     // normalized non-disclosing failure
+	ReasonInvalidCredential Reason = "invalid_credential"       // malformed or tampered credential
+	ReasonMissingCredential Reason = "missing_credential"       // no credential presented
+	ReasonExpiredCredential Reason = "credential_expired"       // well-formed but past expiry
+	ReasonReusedRefresh     Reason = "refresh_replayed"         // refresh credential already consumed
+	ReasonSessionInvalid    Reason = "session_invalid"          // chain invalidated by replay/revocation
+	ReasonSessionEvicted    Reason = "session_evicted"          // pushed out by a newer session (LRU cap)
+	ReasonSessionIdleExp    Reason = "session_idle_expired"     // no activity within idle lifetime
+	ReasonSessionAbsExp     Reason = "session_absolute_expired" // absolute lifetime reached
+	ReasonSessionKicked     Reason = "session_kicked"           // explicitly kicked by the account owner
+	ReasonPermissionDenied  Reason = "permission_denied"        // authenticated but scope absent/revoked
+	ReasonRateLimited       Reason = "rate_limited"             // too many attempts for account/source
+	ReasonInternal          Reason = "internal_error"           // normalized non-disclosing failure
 )
 
 // Error is the normalized error type exposed to callers.
@@ -45,7 +49,17 @@ func ExpiredCredential() *Error { return New(ReasonExpiredCredential, "credentia
 func ReusedRefresh() *Error {
 	return New(ReasonReusedRefresh, "refresh credential has already been used")
 }
-func SessionInvalid() *Error   { return New(ReasonSessionInvalid, "session is no longer valid") }
+func SessionInvalid() *Error { return New(ReasonSessionInvalid, "session is no longer valid") }
+func SessionEvicted() *Error {
+	return New(ReasonSessionEvicted, "session was evicted by a newer login")
+}
+func SessionIdleExpired() *Error {
+	return New(ReasonSessionIdleExp, "session expired after inactivity")
+}
+func SessionAbsoluteExpired() *Error {
+	return New(ReasonSessionAbsExp, "session reached its absolute lifetime; log in again")
+}
+func SessionKicked() *Error    { return New(ReasonSessionKicked, "session was kicked") }
 func PermissionDenied() *Error { return New(ReasonPermissionDenied, "permission denied") }
 func RateLimited() *Error      { return New(ReasonRateLimited, "too many attempts; try again later") }
 func Internal() *Error         { return New(ReasonInternal, "internal error") }

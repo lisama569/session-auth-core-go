@@ -201,18 +201,12 @@ func (s *Service) Refresh(ctx context.Context, rawRefresh, source string) (*Cred
 	// (session_invalid) even under concurrent submissions.
 	res := s.store.Rotate(ctx, claims.SessionID, claims.JTI, newID("rt"), now)
 	if !res.OK {
-		switch {
-		case res.Replayed:
+		if res.Replayed {
 			// Lost the race or presented an already-consumed credential:
 			// the chain is now explicitly invalid.
 			return nil, autherr.ReusedRefresh()
-		case res.Reason == session.StateRevoked:
-			return nil, autherr.New(autherr.ReasonSessionInvalid, "session has been revoked")
-		case res.Reason == session.StateExpired:
-			return nil, autherr.New(autherr.ReasonSessionInvalid, "session has expired")
-		default:
-			return nil, autherr.SessionInvalid()
 		}
+		return nil, sessionStateError(res.Reason)
 	}
 
 	return s.mintBundle(ctx, res.Session)
@@ -260,6 +254,45 @@ func (s *Service) Revoke(ctx context.Context, subject, sessionID string) {
 	s.store.Revoke(ctx, subject, sessionID)
 }
 
+// SessionInfo is the owner-visible view of one active session.
+type SessionInfo struct {
+	SessionID    string
+	Source       string
+	CreatedAt    time.Time
+	LastActiveAt time.Time
+	Version      int
+}
+
+// ListSessions returns the subject's currently active sessions (idle/absolute
+// expiry is applied first), most recently active first.
+func (s *Service) ListSessions(ctx context.Context, subject string) []SessionInfo {
+	active := s.store.ListActive(ctx, subject, s.now())
+	out := make([]SessionInfo, 0, len(active))
+	for _, sess := range active {
+		out = append(out, SessionInfo{
+			SessionID:    sess.ID,
+			Source:       sess.Source,
+			CreatedAt:    sess.CreatedAt,
+			LastActiveAt: sess.LastActiveAt,
+			Version:      sess.Version,
+		})
+	}
+	return out
+}
+
+// KickSession terminates exactly one session. Other sessions of the same
+// account are unaffected; the kicked session observes session_kicked on any
+// later access or refresh attempt.
+func (s *Service) KickSession(ctx context.Context, sessionID string) {
+	s.store.Kick(ctx, sessionID, s.now())
+}
+
+// KickOtherSessions terminates every session of the subject except keepID
+// (typically the caller's current session).
+func (s *Service) KickOtherSessions(ctx context.Context, subject, keepSessionID string) {
+	s.store.KickOthers(ctx, subject, keepSessionID, s.now())
+}
+
 // ResetLimit clears a rate-limit bucket (test/admin utility).
 func (s *Service) ResetLimit(ctx context.Context, k ratelimit.Key) {
 	s.limiter.Reset(ctx, k)
@@ -291,22 +324,17 @@ func (s *Service) authenticate(ctx context.Context, rawAccess string) (*Principa
 		if claims.SessionID == "" {
 			return nil, "", autherr.InvalidCredential()
 		}
-		sess, err := s.store.Get(ctx, claims.SessionID)
+		// Touch is the single decision point for session-bound access: it
+		// applies lazy expiry, records this authentication as activity
+		// (resetting the idle clock) and returns the state, all atomically.
+		sess, state, err := s.store.Touch(ctx, claims.SessionID, now)
 		if err != nil {
 			return nil, "", autherr.SessionInvalid()
 		}
-		switch sess.State {
-		case session.StateActive:
-			sessionBasis = "session " + sess.ID + " active at chain v" + itoa(sess.Version)
-		case session.StateRevoked:
-			return nil, "", autherr.New(autherr.ReasonSessionInvalid, "session has been revoked")
-		case session.StateInvalid:
-			return nil, "", autherr.New(autherr.ReasonSessionInvalid, "session invalidated by refresh replay")
-		case session.StateExpired:
-			return nil, "", autherr.New(autherr.ReasonSessionInvalid, "session has expired")
-		default:
-			return nil, "", autherr.SessionInvalid()
+		if state != session.StateActive {
+			return nil, "", sessionStateError(state)
 		}
+		sessionBasis = "session " + sess.ID + " active at chain v" + itoa(sess.Version)
 	}
 
 	// Effective scopes = live policy scopes intersected with credential scopes.
@@ -360,6 +388,30 @@ func (s *Service) mintBundle(ctx context.Context, sess *session.Session) (*Crede
 		AccessExpires:  accessClaims.ExpiresAt,
 		RefreshExpires: refreshClaims.ExpiresAt,
 	}, nil
+}
+
+// sessionStateError maps a terminal session state to its normalized,
+// distinguishable rejection reason. Replay-invalidated chains and explicit
+// revocations stay on the historical session_invalid reason; the governance
+// outcomes (evicted / idle / absolute / kicked) each get their own reason so
+// callers can tell them apart from credential problems.
+func sessionStateError(state session.State) *autherr.Error {
+	switch state {
+	case session.StateEvicted:
+		return autherr.SessionEvicted()
+	case session.StateIdleExpired:
+		return autherr.SessionIdleExpired()
+	case session.StateAbsExpired:
+		return autherr.SessionAbsoluteExpired()
+	case session.StateKicked:
+		return autherr.SessionKicked()
+	case session.StateRevoked:
+		return autherr.New(autherr.ReasonSessionInvalid, "session has been revoked")
+	case session.StateExpired:
+		return autherr.New(autherr.ReasonSessionInvalid, "session has expired")
+	default:
+		return autherr.SessionInvalid()
+	}
 }
 
 func passwordOK(rec userRec, password string) bool {
